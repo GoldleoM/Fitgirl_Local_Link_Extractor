@@ -88,7 +88,7 @@ def find_browser_path() -> Optional[str]:
 
 
 class LinkExtractorEngine:
-    """Multi-threaded parallel extraction engine with smart pacing and auto-retry."""
+    """Multi-threaded parallel extraction engine with smart pacing, auto-retry, and rate-limit detection."""
 
     # Default settings
     DEFAULT_SETTINGS = {
@@ -98,6 +98,7 @@ class LinkExtractorEngine:
         "max_retries": 3,
         "page_load_timeout": 16,
         "turnstile_timeout": 20,
+        "rate_limit_cooldown": 60,
     }
 
     def __init__(
@@ -148,6 +149,7 @@ class LinkExtractorEngine:
         max_retries = self.settings["max_retries"]
         page_load_timeout = self.settings["page_load_timeout"]
         turnstile_timeout = self.settings["turnstile_timeout"]
+        rate_limit_cooldown = self.settings.get("rate_limit_cooldown", 60)
         poll_interval = 0.02
 
         total = len(clean_links)
@@ -155,7 +157,7 @@ class LinkExtractorEngine:
         mode_str = "Stealth (Off-Screen)" if stealth_mode else "Visible Window"
 
         self.log("INFO", f"Launching browser engine ({os.path.basename(browser_path)})...")
-        self.log("INFO", f"Mode: {mode_str} | {pool_size} parallel workers | {int(inter_request_delay*1000)}ms pacing")
+        self.log("INFO", f"Mode: {mode_str} | {pool_size} parallel workers | {int(inter_request_delay*1000)}ms pacing | {rate_limit_cooldown}s cooldown on rate limit")
 
         options = ChromiumOptions()
         options.set_browser_path(browser_path)
@@ -209,8 +211,55 @@ class LinkExtractorEngine:
         file_lock = threading.Lock()
         engine_ref = self
 
+        # Global rate-limit coordination across all worker threads
+        rate_limit_lock = threading.Lock()
+        rate_limit_active = threading.Event()
+        rate_limit_active.set()
+
+        def check_for_rate_limit(tab_instance, status_code: int = 200, response_text: str = "") -> bool:
+            """Inspects tab and response content for rate limit / 429 / 1015 error signatures."""
+            if status_code in (429, 503):
+                return True
+            try:
+                page_text = (tab_instance.text or "").lower()
+                page_html = (tab_instance.html or "").lower()
+            except Exception:
+                page_text = ""
+                page_html = ""
+            combined = f"{page_text} {page_html} {response_text.lower()}"
+            rate_limit_keywords = [
+                "error 1015", "you are being rate limited", "rate limited",
+                "too many requests", "429 too many", "error 429", "status code 429",
+                "please try again later", "please wait a few minutes", "retry-after"
+            ]
+            return any(kw in combined for kw in rate_limit_keywords)
+
+        def handle_rate_limit(source: str, idx: int, link: str, retries: int):
+            """Synchronously pauses all worker threads and conducts a countdown."""
+            with rate_limit_lock:
+                if rate_limit_active.is_set():
+                    rate_limit_active.clear()
+                    cd = engine_ref.settings.get("rate_limit_cooldown", 60)
+                    engine_ref.log("WARN", f"⚠️ RATE LIMIT DETECTED [{source}]! Pausing all workers for {cd}s cooldown...")
+                    for rem in range(cd, 0, -1):
+                        if not engine_ref.is_running:
+                            break
+                        engine_ref.progress_callback(extracted_count[0], total, f"Rate limited! Resuming in {rem}s...")
+                        if rem % 10 == 0 or rem <= 5:
+                            engine_ref.log("WARN", f"⏳ Rate limit cooldown: {rem}s remaining...")
+                        time.sleep(1)
+                    if engine_ref.is_running:
+                        engine_ref.log("SUCCESS", "✅ Rate limit cooldown completed. Resuming all workers...")
+                        rate_limit_active.set()
+
+            # Return link to queue without consuming retry attempt
+            links_queue.put((idx, link, retries))
+            rate_limit_active.wait()
+
         def worker_thread(worker_id: int, tab):
             while engine_ref.is_running:
+                rate_limit_active.wait()
+
                 try:
                     idx, link, retries = links_queue.get_nowait()
                 except queue.Empty:
@@ -225,8 +274,19 @@ class LinkExtractorEngine:
 
                     tab.get(link, retry=1, timeout=page_load_timeout)
 
+                    # Check if landed on rate limit page
+                    if check_for_rate_limit(tab):
+                        handle_rate_limit(f"Page Load #{idx}", idx, link, retries)
+                        links_queue.task_done()
+                        continue
+
                     btn = tab.ele('text:DOWNLOAD', timeout=page_load_timeout)
                     if not btn:
+                        if check_for_rate_limit(tab):
+                            handle_rate_limit(f"Missing Button #{idx}", idx, link, retries)
+                            links_queue.task_done()
+                            continue
+
                         if retries < max_retries:
                             backoff = 1.5 * (retries + 1)
                             engine_ref.log("WARN", f"[{idx}/{total}] Button missing, retrying in {backoff:.1f}s...")
@@ -238,7 +298,7 @@ class LinkExtractorEngine:
 
                     active = False
                     for _ in range(int(turnstile_timeout / poll_interval)):
-                        if not engine_ref.is_running:
+                        if not engine_ref.is_running or not rate_limit_active.is_set():
                             break
                         try:
                             style = btn.attr('style')
@@ -252,7 +312,18 @@ class LinkExtractorEngine:
                     if not engine_ref.is_running:
                         break
 
+                    if not rate_limit_active.is_set():
+                        # Another thread triggered rate limit while we were waiting
+                        links_queue.put((idx, link, retries))
+                        rate_limit_active.wait()
+                        continue
+
                     if not active:
+                        if check_for_rate_limit(tab):
+                            handle_rate_limit(f"Turnstile Block #{idx}", idx, link, retries)
+                            links_queue.task_done()
+                            continue
+
                         if retries < max_retries:
                             backoff = 2.0 * (retries + 1)
                             engine_ref.log("WARN", f"[{idx}/{total}] Turnstile slow, retrying in {backoff:.1f}s...")
@@ -267,13 +338,29 @@ class LinkExtractorEngine:
                         xhr.open('POST', '/f/{file_id}/go', false);
                         xhr.setRequestHeader('HX-Request', 'true');
                         xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
-                        xhr.send('cf-turnstile-response=' + encodeURIComponent(window.turnstileToken || ''));
-                        return xhr.getResponseHeader('hx-redirect');
+                        try {{
+                            xhr.send('cf-turnstile-response=' + encodeURIComponent(window.turnstileToken || ''));
+                            return {{
+                                status: xhr.status,
+                                redirect: xhr.getResponseHeader('hx-redirect'),
+                                body: xhr.responseText ? xhr.responseText.substring(0, 300) : ''
+                            }};
+                        }} catch (e) {{
+                            return {{ status: -1, error: e.toString() }};
+                        }}
                     '''
 
-                    dl_url = tab.run_js(js_extract)
+                    xhr_res = tab.run_js(js_extract)
+                    status_code = xhr_res.get('status', 0) if isinstance(xhr_res, dict) else 200
+                    body_text = xhr_res.get('body', '') if isinstance(xhr_res, dict) else ''
+                    dl_url = xhr_res.get('redirect') if isinstance(xhr_res, dict) else xhr_res
 
-                    if dl_url:
+                    if check_for_rate_limit(tab, status_code=status_code, response_text=body_text):
+                        handle_rate_limit(f"XHR Code {status_code} on #{idx}", idx, link, retries)
+                        links_queue.task_done()
+                        continue
+
+                    if dl_url and isinstance(dl_url, str) and (dl_url.startswith("http://") or dl_url.startswith("https://")):
                         with file_lock:
                             extracted_results.append((idx, dl_url))
                             extracted_count[0] += 1
@@ -347,7 +434,7 @@ class SettingsDialog(ctk.CTkToplevel):
     def __init__(self, parent, current_settings: dict):
         super().__init__(parent)
         self.title("⚙️ Extraction Settings")
-        self.geometry("460x520")
+        self.geometry("480x590")
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
@@ -356,8 +443,8 @@ class SettingsDialog(ctk.CTkToplevel):
 
         # Center on parent
         self.update_idletasks()
-        x = parent.winfo_x() + (parent.winfo_width() - 460) // 2
-        y = parent.winfo_y() + (parent.winfo_height() - 520) // 2
+        x = parent.winfo_x() + (parent.winfo_width() - 480) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - 590) // 2
         self.geometry(f"+{x}+{y}")
 
         self.grid_columnconfigure(0, weight=1)
@@ -368,13 +455,13 @@ class SettingsDialog(ctk.CTkToplevel):
             font=ctk.CTkFont(size=20, weight="bold"),
             text_color=("#ec4899", "#f43f5e"),
         )
-        title.grid(row=0, column=0, padx=20, pady=(20, 4))
+        title.grid(row=0, column=0, padx=20, pady=(18, 2))
 
         subtitle = ctk.CTkLabel(
-            self, text="Tune performance, stealth, and retry behavior",
+            self, text="Tune performance, stealth, pacing, and rate-limit cooldown",
             font=ctk.CTkFont(size=12), text_color="gray60",
         )
-        subtitle.grid(row=1, column=0, padx=20, pady=(0, 16))
+        subtitle.grid(row=1, column=0, padx=20, pady=(0, 14))
 
         # Settings container
         container = ctk.CTkFrame(self, corner_radius=12)
@@ -385,10 +472,10 @@ class SettingsDialog(ctk.CTkToplevel):
 
         # --- Parallel Threads ---
         ctk.CTkLabel(container, text="Parallel Threads", font=ctk.CTkFont(size=13, weight="bold")).grid(
-            row=row, column=0, padx=16, pady=(16, 2), sticky="w")
+            row=row, column=0, padx=16, pady=(14, 2), sticky="w")
         self.threads_var = tk.IntVar(value=current_settings.get("max_concurrency", 8))
         threads_frame = ctk.CTkFrame(container, fg_color="transparent")
-        threads_frame.grid(row=row, column=1, padx=16, pady=(16, 2), sticky="e")
+        threads_frame.grid(row=row, column=1, padx=16, pady=(14, 2), sticky="e")
         self.threads_label = ctk.CTkLabel(threads_frame, text=str(self.threads_var.get()),
                                           font=ctk.CTkFont(size=13, weight="bold"), width=30)
         self.threads_label.pack(side="right", padx=(8, 0))
@@ -402,7 +489,7 @@ class SettingsDialog(ctk.CTkToplevel):
 
         # --- Stealth Mode ---
         ctk.CTkLabel(container, text="Stealth Mode", font=ctk.CTkFont(size=13, weight="bold")).grid(
-            row=row, column=0, padx=16, pady=(12, 2), sticky="w")
+            row=row, column=0, padx=16, pady=(10, 2), sticky="w")
         ctk.CTkLabel(container, text="Hide browser window", font=ctk.CTkFont(size=11), text_color="gray60").grid(
             row=row + 1, column=0, padx=16, pady=(0, 2), sticky="w")
         self.stealth_var = tk.BooleanVar(value=current_settings.get("stealth_mode", True))
@@ -410,16 +497,16 @@ class SettingsDialog(ctk.CTkToplevel):
             container, text="", variable=self.stealth_var,
             onvalue=True, offvalue=False,
         )
-        self.stealth_switch.grid(row=row, column=1, rowspan=2, padx=16, pady=(12, 2), sticky="e")
+        self.stealth_switch.grid(row=row, column=1, rowspan=2, padx=16, pady=(10, 2), sticky="e")
         row += 2
 
         # --- Request Delay ---
         ctk.CTkLabel(container, text="Request Delay", font=ctk.CTkFont(size=13, weight="bold")).grid(
-            row=row, column=0, padx=16, pady=(12, 2), sticky="w")
+            row=row, column=0, padx=16, pady=(10, 2), sticky="w")
         delay_ms = int(current_settings.get("inter_request_delay", 0.20) * 1000)
         self.delay_var = tk.IntVar(value=delay_ms)
         delay_frame = ctk.CTkFrame(container, fg_color="transparent")
-        delay_frame.grid(row=row, column=1, padx=16, pady=(12, 2), sticky="e")
+        delay_frame.grid(row=row, column=1, padx=16, pady=(10, 2), sticky="e")
         self.delay_label = ctk.CTkLabel(delay_frame, text=f"{delay_ms}ms",
                                         font=ctk.CTkFont(size=13, weight="bold"), width=50)
         self.delay_label.pack(side="right", padx=(8, 0))
@@ -431,12 +518,29 @@ class SettingsDialog(ctk.CTkToplevel):
         self.delay_slider.pack(side="right")
         row += 1
 
+        # --- Rate Limit Cooldown ---
+        ctk.CTkLabel(container, text="Rate Limit Cooldown", font=ctk.CTkFont(size=13, weight="bold")).grid(
+            row=row, column=0, padx=16, pady=(10, 2), sticky="w")
+        self.cooldown_var = tk.IntVar(value=current_settings.get("rate_limit_cooldown", 60))
+        cooldown_frame = ctk.CTkFrame(container, fg_color="transparent")
+        cooldown_frame.grid(row=row, column=1, padx=16, pady=(10, 2), sticky="e")
+        self.cooldown_label = ctk.CTkLabel(cooldown_frame, text=f"{self.cooldown_var.get()}s",
+                                           font=ctk.CTkFont(size=13, weight="bold"), width=40)
+        self.cooldown_label.pack(side="right", padx=(8, 0))
+        self.cooldown_slider = ctk.CTkSlider(
+            cooldown_frame, from_=15, to=180, number_of_steps=33,
+            variable=self.cooldown_var, width=140,
+            command=lambda v: self.cooldown_label.configure(text=f"{int(v)}s"),
+        )
+        self.cooldown_slider.pack(side="right")
+        row += 1
+
         # --- Max Retries ---
         ctk.CTkLabel(container, text="Max Retries", font=ctk.CTkFont(size=13, weight="bold")).grid(
-            row=row, column=0, padx=16, pady=(12, 2), sticky="w")
+            row=row, column=0, padx=16, pady=(10, 2), sticky="w")
         self.retries_var = tk.IntVar(value=current_settings.get("max_retries", 3))
         retries_frame = ctk.CTkFrame(container, fg_color="transparent")
-        retries_frame.grid(row=row, column=1, padx=16, pady=(12, 2), sticky="e")
+        retries_frame.grid(row=row, column=1, padx=16, pady=(10, 2), sticky="e")
         self.retries_label = ctk.CTkLabel(retries_frame, text=str(self.retries_var.get()),
                                           font=ctk.CTkFont(size=13, weight="bold"), width=30)
         self.retries_label.pack(side="right", padx=(8, 0))
@@ -450,10 +554,10 @@ class SettingsDialog(ctk.CTkToplevel):
 
         # --- Page Timeout ---
         ctk.CTkLabel(container, text="Page Timeout", font=ctk.CTkFont(size=13, weight="bold")).grid(
-            row=row, column=0, padx=16, pady=(12, 16), sticky="w")
+            row=row, column=0, padx=16, pady=(10, 14), sticky="w")
         self.timeout_var = tk.IntVar(value=current_settings.get("page_load_timeout", 16))
         timeout_frame = ctk.CTkFrame(container, fg_color="transparent")
-        timeout_frame.grid(row=row, column=1, padx=16, pady=(12, 16), sticky="e")
+        timeout_frame.grid(row=row, column=1, padx=16, pady=(10, 14), sticky="e")
         self.timeout_label = ctk.CTkLabel(timeout_frame, text=f"{self.timeout_var.get()}s",
                                           font=ctk.CTkFont(size=13, weight="bold"), width=40)
         self.timeout_label.pack(side="right", padx=(8, 0))
@@ -467,7 +571,7 @@ class SettingsDialog(ctk.CTkToplevel):
 
         # --- Buttons ---
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        btn_frame.grid(row=3, column=0, padx=20, pady=(20, 20), sticky="ew")
+        btn_frame.grid(row=3, column=0, padx=20, pady=(16, 16), sticky="ew")
         btn_frame.grid_columnconfigure((0, 1), weight=1)
 
         ctk.CTkButton(
@@ -489,6 +593,7 @@ class SettingsDialog(ctk.CTkToplevel):
             "max_concurrency": int(self.threads_var.get()),
             "stealth_mode": bool(self.stealth_var.get()),
             "inter_request_delay": int(self.delay_var.get()) / 1000.0,
+            "rate_limit_cooldown": int(self.cooldown_var.get()),
             "max_retries": int(self.retries_var.get()),
             "page_load_timeout": int(self.timeout_var.get()),
             "turnstile_timeout": int(self.timeout_var.get()) + 4,
@@ -1011,6 +1116,7 @@ class FastLinkApp(ctk.CTk):
                 f"Settings updated: {self.extraction_settings['max_concurrency']} threads, "
                 f"{'Stealth' if self.extraction_settings['stealth_mode'] else 'Visible'} mode, "
                 f"{int(self.extraction_settings['inter_request_delay']*1000)}ms delay, "
+                f"{self.extraction_settings.get('rate_limit_cooldown', 60)}s cooldown, "
                 f"{self.extraction_settings['max_retries']} retries"
             )
 

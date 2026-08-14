@@ -63,7 +63,7 @@ INTER_REQUEST_DELAY = 0.20 # 200ms delay between link requests (prevents rate li
 PAGE_LOAD_TIMEOUT = 16     # Max seconds to wait for page to reach download button
 TURNSTILE_TIMEOUT = 20     # Max seconds for Turnstile bot-check to clear
 MICRO_POLL_INTERVAL = 0.02 # 20ms high-frequency check
-MAX_RETRIES = 3            # Auto-retry attempts on temporary Cloudflare challenges
+RATE_LIMIT_COOLDOWN = 60 # Cooldown seconds when Cloudflare / Host rate limits
 # =======================================================
 
 # Resolve input and output paths
@@ -163,9 +163,58 @@ rate_limit_lock = threading.Lock()
 start_time_all = time.time()
 
 
+MAX_RETRIES = 3            # Auto-retry attempts on temporary Cloudflare challenges
+
+# Global rate-limit coordination across all worker threads
+rate_limit_lock = threading.Lock()
+rate_limit_active = threading.Event()
+rate_limit_active.set()
+
+
+def check_for_rate_limit(tab_instance, status_code: int = 200, response_text: str = "") -> bool:
+    """Inspects tab and response content for rate limit / 429 / 1015 error signatures."""
+    if status_code in (429, 503):
+        return True
+    try:
+        page_text = (tab_instance.text or "").lower()
+        page_html = (tab_instance.html or "").lower()
+    except Exception:
+        page_text = ""
+        page_html = ""
+    combined = f"{page_text} {page_html} {response_text.lower()}"
+    rate_limit_keywords = [
+        "error 1015", "you are being rate limited", "rate limited",
+        "too many requests", "429 too many", "error 429", "status code 429",
+        "please try again later", "please wait a few minutes", "retry-after"
+    ]
+    return any(kw in combined for kw in rate_limit_keywords)
+
+
+def handle_rate_limit(source: str, idx: int, link: str, retries: int):
+    """Synchronously pauses all worker threads and conducts a countdown."""
+    with rate_limit_lock:
+        if rate_limit_active.is_set():
+            rate_limit_active.clear()
+            log.warning("=" * 60)
+            log.warning(f"⚠️ RATE LIMIT DETECTED [{source}]! Pausing all workers for {RATE_LIMIT_COOLDOWN}s cooldown...")
+            log.warning("=" * 60)
+            for rem in range(RATE_LIMIT_COOLDOWN, 0, -1):
+                if rem % 10 == 0 or rem <= 5:
+                    log.warning(f"⏳ Rate limited. Cooling down... {rem}s remaining")
+                time.sleep(1)
+            log.success("✅ Rate limit cooldown completed. Resuming all workers...")
+            rate_limit_active.set()
+
+    # Return link to queue without consuming retry attempt
+    links_queue.put((idx, link, retries))
+    rate_limit_active.wait()
+
+
 def worker_thread(worker_id: int, tab):
-    """Worker thread with adaptive pacing and automatic rate-limit backoff."""
+    """Worker thread with adaptive pacing, auto-retry, and rate-limit cooldown."""
     while True:
+        rate_limit_active.wait()
+
         try:
             idx, link, retries = links_queue.get_nowait()
         except queue.Empty:
@@ -182,9 +231,19 @@ def worker_thread(worker_id: int, tab):
 
             tab.get(link, retry=1, timeout=PAGE_LOAD_TIMEOUT)
 
+            if check_for_rate_limit(tab):
+                handle_rate_limit(f"Page Load #{idx}", idx, link, retries)
+                links_queue.task_done()
+                continue
+
             # Locate DOWNLOAD button
             btn = tab.ele('text:DOWNLOAD', timeout=PAGE_LOAD_TIMEOUT)
             if not btn:
+                if check_for_rate_limit(tab):
+                    handle_rate_limit(f"Missing Button #{idx}", idx, link, retries)
+                    links_queue.task_done()
+                    continue
+
                 if retries < MAX_RETRIES:
                     backoff = 1.5 * (retries + 1)
                     log.warning(f"[{idx:03d}/{total_links:03d}] [T#{worker_id:02d}] Button missing, backing off {backoff:.1f}s and retrying...", link)
@@ -197,6 +256,8 @@ def worker_thread(worker_id: int, tab):
             # Micro-polling for Turnstile completion
             active = False
             for _ in range(int(TURNSTILE_TIMEOUT / MICRO_POLL_INTERVAL)):
+                if not rate_limit_active.is_set():
+                    break
                 try:
                     style = btn.attr('style')
                     if not style or ('opacity' not in style and '0.5' not in style):
@@ -206,7 +267,17 @@ def worker_thread(worker_id: int, tab):
                     pass
                 time.sleep(MICRO_POLL_INTERVAL)
 
+            if not rate_limit_active.is_set():
+                links_queue.put((idx, link, retries))
+                rate_limit_active.wait()
+                continue
+
             if not active:
+                if check_for_rate_limit(tab):
+                    handle_rate_limit(f"Turnstile Block #{idx}", idx, link, retries)
+                    links_queue.task_done()
+                    continue
+
                 if retries < MAX_RETRIES:
                     backoff = 2.0 * (retries + 1)
                     log.warning(f"[{idx:03d}/{total_links:03d}] [T#{worker_id:02d}] Turnstile slow, re-queuing with {backoff:.1f}s pause...", link)
@@ -222,14 +293,31 @@ def worker_thread(worker_id: int, tab):
                 xhr.open('POST', '/f/{file_id}/go', false);
                 xhr.setRequestHeader('HX-Request', 'true');
                 xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
-                xhr.send('cf-turnstile-response=' + encodeURIComponent(window.turnstileToken || ''));
-                return xhr.getResponseHeader('hx-redirect');
+                try {{
+                    xhr.send('cf-turnstile-response=' + encodeURIComponent(window.turnstileToken || ''));
+                    return {{
+                        status: xhr.status,
+                        redirect: xhr.getResponseHeader('hx-redirect'),
+                        body: xhr.responseText ? xhr.responseText.substring(0, 300) : ''
+                    }};
+                }} catch (e) {{
+                    return {{ status: -1, error: e.toString() }};
+                }}
             '''
 
-            dl_url = tab.run_js(js_extract)
+            xhr_res = tab.run_js(js_extract)
+            status_code = xhr_res.get('status', 0) if isinstance(xhr_res, dict) else 200
+            body_text = xhr_res.get('body', '') if isinstance(xhr_res, dict) else ''
+            dl_url = xhr_res.get('redirect') if isinstance(xhr_res, dict) else xhr_res
+
+            if check_for_rate_limit(tab, status_code=status_code, response_text=body_text):
+                handle_rate_limit(f"XHR Code {status_code} on #{idx}", idx, link, retries)
+                links_queue.task_done()
+                continue
+
             elapsed_ms = (time.time() - start_t) * 1000
 
-            if dl_url:
+            if dl_url and isinstance(dl_url, str) and (dl_url.startswith("http://") or dl_url.startswith("https://")):
                 with file_lock:
                     extracted_results.append((idx, dl_url))
                     with open(output_path, "a", encoding="utf-8") as f:

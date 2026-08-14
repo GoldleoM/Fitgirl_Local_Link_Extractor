@@ -85,6 +85,7 @@ Click the **⚙️ Settings** button in the header to configure:
 | **Parallel Threads** | 8 | Number of concurrent browser tabs (1–20). Higher = faster, but may trigger rate limits. |
 | **Stealth Mode** | On | Hides the browser window completely off-screen. Turn off to watch extraction live. |
 | **Request Delay** | 200ms | Pause between requests per thread. Prevents Cloudflare rate limiting. |
+| **Rate Limit Cooldown** | 60s | Synchronized pause duration with live countdown when Cloudflare/429 rate limit is detected. |
 | **Max Retries** | 3 | Auto-retry attempts if a link fails due to temporary challenges. |
 | **Page Timeout** | 16s | Maximum wait time for a page to load before skipping. |
 
