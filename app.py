@@ -217,39 +217,57 @@ class LinkExtractorEngine:
         rate_limit_active.set()
 
         def check_for_rate_limit(tab_instance, status_code: int = 200, response_text: str = "") -> bool:
-            """Inspects tab and response content for rate limit / 429 / 1015 error signatures."""
-            if status_code in (429, 503):
+            """Inspects tab and response content for Cloudflare challenge, 429, 1015, or rate limit signatures."""
+            if status_code in (429, 503, 403):
                 return True
             try:
+                page_title = (tab_instance.title or "").lower()
                 page_text = (tab_instance.text or "").lower()
                 page_html = (tab_instance.html or "").lower()
             except Exception:
+                page_title = ""
                 page_text = ""
                 page_html = ""
-            combined = f"{page_text} {page_html} {response_text.lower()}"
-            rate_limit_keywords = [
+            combined = f"{page_title} {page_text} {page_html} {response_text.lower()}"
+            block_keywords = [
                 "error 1015", "you are being rate limited", "rate limited",
                 "too many requests", "429 too many", "error 429", "status code 429",
-                "please try again later", "please wait a few minutes", "retry-after"
+                "please try again later", "please wait a few minutes", "retry-after",
+                "just a moment...", "checking your browser", "turnstile challenge",
+                "cf-challenge", "challenges.cloudflare.com"
             ]
-            return any(kw in combined for kw in rate_limit_keywords)
+            return any(kw in combined for kw in block_keywords)
 
-        def handle_rate_limit(source: str, idx: int, link: str, retries: int):
-            """Synchronously pauses all worker threads and conducts a countdown."""
+        def handle_rate_limit(source: str, idx: int, link: str, retries: int, tab_instance=None):
+            """Synchronously pauses all worker threads, clears the challenge on one tab, or conducts a countdown."""
             with rate_limit_lock:
                 if rate_limit_active.is_set():
                     rate_limit_active.clear()
                     cd = engine_ref.settings.get("rate_limit_cooldown", 60)
-                    engine_ref.log("WARN", f"⚠️ RATE LIMIT DETECTED [{source}]! Pausing all workers for {cd}s cooldown...")
-                    for rem in range(cd, 0, -1):
-                        if not engine_ref.is_running:
-                            break
-                        engine_ref.progress_callback(extracted_count[0], total, f"Rate limited! Resuming in {rem}s...")
-                        if rem % 10 == 0 or rem <= 5:
-                            engine_ref.log("WARN", f"⏳ Rate limit cooldown: {rem}s remaining...")
-                        time.sleep(1)
+                    engine_ref.log("WARN", f"⚠️ CLOUDFLARE CHALLENGE / RATE LIMIT DETECTED [{source}]! Pausing all workers...")
+
+                    # Try to solve challenge on the current tab first if visible or active
+                    solved = False
+                    if tab_instance:
+                        try:
+                            engine_ref.log("INFO", "Attempting automatic challenge resolution on master tab...")
+                            btn = tab_instance.ele('text:DOWNLOAD', timeout=12)
+                            if btn:
+                                solved = True
+                        except Exception:
+                            pass
+
+                    if not solved:
+                        for rem in range(cd, 0, -1):
+                            if not engine_ref.is_running:
+                                break
+                            engine_ref.progress_callback(extracted_count[0], total, f"Rate limited/Challenge! Resuming in {rem}s...")
+                            if rem % 10 == 0 or rem <= 5:
+                                engine_ref.log("WARN", f"⏳ Paused: {rem}s cooldown remaining...")
+                            time.sleep(1)
+
                     if engine_ref.is_running:
-                        engine_ref.log("SUCCESS", "✅ Rate limit cooldown completed. Resuming all workers...")
+                        engine_ref.log("SUCCESS", "✅ Resuming all worker threads...")
                         rate_limit_active.set()
 
             # Return link to queue without consuming retry attempt
@@ -276,14 +294,14 @@ class LinkExtractorEngine:
 
                     # Check if landed on rate limit page
                     if check_for_rate_limit(tab):
-                        handle_rate_limit(f"Page Load #{idx}", idx, link, retries)
+                        handle_rate_limit(f"Page Load #{idx}", idx, link, retries, tab_instance=tab)
                         links_queue.task_done()
                         continue
 
                     btn = tab.ele('text:DOWNLOAD', timeout=page_load_timeout)
                     if not btn:
                         if check_for_rate_limit(tab):
-                            handle_rate_limit(f"Missing Button #{idx}", idx, link, retries)
+                            handle_rate_limit(f"Missing Button #{idx}", idx, link, retries, tab_instance=tab)
                             links_queue.task_done()
                             continue
 
@@ -320,7 +338,7 @@ class LinkExtractorEngine:
 
                     if not active:
                         if check_for_rate_limit(tab):
-                            handle_rate_limit(f"Turnstile Block #{idx}", idx, link, retries)
+                            handle_rate_limit(f"Turnstile Block #{idx}", idx, link, retries, tab_instance=tab)
                             links_queue.task_done()
                             continue
 
@@ -356,7 +374,7 @@ class LinkExtractorEngine:
                     dl_url = xhr_res.get('redirect') if isinstance(xhr_res, dict) else xhr_res
 
                     if check_for_rate_limit(tab, status_code=status_code, response_text=body_text):
-                        handle_rate_limit(f"XHR Code {status_code} on #{idx}", idx, link, retries)
+                        handle_rate_limit(f"XHR Code {status_code} on #{idx}", idx, link, retries, tab_instance=tab)
                         links_queue.task_done()
                         continue
 
