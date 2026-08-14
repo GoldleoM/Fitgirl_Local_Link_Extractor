@@ -34,18 +34,38 @@ pip install -r requirements.txt
 
 ---
 
-## 🚀 How to Use
+## 🚀 Ways to Run the App
 
-### 1. Launching the GUI App
-Double-click **`run.bat`** (or run `python app.py` in your terminal).
+### Option A: Standalone Executable (Zero Setup - Runs on Any Windows PC)
+If you want to share this tool with friends or use it without installing Python:
+1. Double-click **`FitGirl_Link_Extractor.exe`** directly.
+2. No Python, terminal, or setup script is needed!
 
-### 2. Extracting Links
+---
+
+### Option B: Automated Script Launcher (With Python)
+If running from source:
+1. Double-click **`setup.bat`** once to install dependencies.
+2. Double-click **`run.bat`** (or run `python app.py` in your terminal).
+
+---
+
+### 🔨 Rebuilding the Standalone Executable
+To build a fresh `.exe` from source:
+- Double-click **`build.bat`**.
+- The script will compile everything and output `FitGirl_Link_Extractor.exe`.
+
+---
+
+## 🕹️ How to Use
+
+### 1. Extracting Links
 1. **Paste your links** into the input box on the left:
    - You can copy the entire fuckingfast list from the FitGirl repack page (even lines with `- https://...`).
    - Or click **`📂 Load File`** to load your `input.txt`.
 2. Click **`▶ Start Fetching Links`**.
 3. **Live Progress**:
-   - The app will automatically open your Chrome engine, bypass any Cloudflare Turnstile challenges, and extract the real download links.
+   - The app will automatically open your Chromium engine (Chrome, Edge, or Brave), bypass any Cloudflare Turnstile challenges, and extract the real download links.
    - The **Live Activity Console** will show real-time progress for each part.
 4. **Get Your Links**:
    - Extracted direct download URLs (`https://dl.fuckingfast.co/dl/...`) will appear in the right panel.
@@ -68,24 +88,17 @@ If you prefer running without a GUI:
 
 ## 🛠️ Troubleshooting & FAQ
 
-### 1. "Python is NOT installed or NOT found in your system PATH"
-- **Cause**: Python is missing or was installed without the PATH environment variable.
-- **Fix**: Download Python from [python.org/downloads](https://www.python.org/downloads/). Run the installer, click **Modify** or **Install**, and make sure **`Add python.exe to PATH`** is checked.
-
-### 2. "Turnstile challenge was not resolved in time" / CAPTCHA Popups
+### 1. "Turnstile challenge was not resolved in time" / CAPTCHA Popups
 - **Cause**: Cloudflare occasionally triggers an interactive "Verify you are human" check if your IP address recently changed or high-security mode is active.
-- **Fix**: When the automated Chrome window appears with a checkbox, **simply click the tick box once**. The extractor will immediately detect the solved token and continue automatically.
+- **Fix**: When the automated browser window appears with a checkbox, **simply click the tick box once**. The extractor will immediately detect the solved token and continue automatically.
 
-### 3. "Could not locate Google Chrome or Edge on this system"
-- **Cause**: The browser is installed in a non-standard location.
-- **Fix**: Ensure Google Chrome or Microsoft Edge is installed in `C:\Program Files` or `C:\Program Files (x86)`.
+### 2. "Could not locate Google Chrome or Edge on this system"
+- **Cause**: No Chromium-based browser is installed.
+- **Fix**: Ensure Google Chrome, Microsoft Edge, or Brave is installed. The tool automatically searches Windows Registry, System PATH, Program Files, and AppData directories.
 
-### 4. "HTTP 403 Forbidden" Error
+### 3. "HTTP 403 Forbidden" Error
 - **Cause**: Occurs when trying to scrape `fuckingfast.co` with basic HTTP tools (like `curl` or `requests`) without browser fingerprinting.
-- **Fix**: Always run extraction through `run.bat` / `app.py` / `download.py`, which utilizes authentic Chromium DevTools Protocol (CDP) to pass Cloudflare checks.
-
-### 5. Why are my files not downloading in the browser?
-- The tool is designed to **extract direct links only**, preventing unwanted ad tabs, popups, and random browser downloads. You can feed the final links directly into a download manager like JDownloader 2 for full-speed parallel downloading.
+- **Fix**: Always run extraction through `FitGirl_Link_Extractor.exe`, `run.bat`, `app.py`, or `download.py`, which utilizes authentic Chromium DevTools Protocol (CDP) to pass Cloudflare checks.
 
 ---
 
@@ -94,13 +107,16 @@ If you prefer running without a GUI:
 ```
 Fitgirl_Local/
 │
-├── app.py              # Modern GUI application (CustomTkinter + DrissionPage engine)
-├── download.py         # Standalone CLI extraction script
-├── setup.bat           # Automated environment validator & package installer
-├── install.bat         # Alias for setup.bat
-├── run.bat             # One-click app launcher
-├── requirements.txt    # Python dependencies
-├── input.txt           # Working input file for links
-├── download_links.txt  # Output file containing direct download URLs
-└── README.md           # User guide and documentation
+├── FitGirl_Link_Extractor.exe # Standalone executable (runs on any Windows PC without Python)
+├── app.py                     # Modern GUI application (CustomTkinter + DrissionPage engine)
+├── download.py                # Standalone CLI extraction script
+├── build.bat                  # One-click PyInstaller standalone builder
+├── setup.bat                  # Automated environment validator & package installer
+├── install.bat                # Alias for setup.bat
+├── run.bat                    # One-click app launcher
+├── requirements.txt           # Python dependencies (including pyinstaller)
+├── input.txt                  # Working input file for links
+├── download_links.txt         # Output file containing direct download URLs
+└── README.md                  # User guide and documentation
 ```
+

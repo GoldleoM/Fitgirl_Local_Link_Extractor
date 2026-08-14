@@ -10,24 +10,80 @@ from tkinter import messagebox, filedialog
 import customtkinter as ctk
 from DrissionPage import ChromiumPage, ChromiumOptions
 
+import shutil
+import subprocess
+
 # Set visual theme
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
 
 def find_browser_path() -> Optional[str]:
-    """Finds an installed Chromium browser (Chrome, Edge, Brave)."""
+    """Finds an installed Chromium browser (Chrome, Edge, Brave, Chromium) across Windows, Linux, and macOS."""
+    # 1. Check system PATH
+    for binary in ["chrome", "google-chrome", "google-chrome-stable", "msedge", "brave", "brave-browser", "chromium", "chromium-browser"]:
+        found = shutil.which(binary)
+        if found and os.path.isfile(found):
+            return found
+
+    # 2. Check Windows Registry
+    if sys.platform.startswith("win"):
+        try:
+            import winreg
+            reg_paths = [
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\brave.exe"),
+                (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"),
+                (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe"),
+                (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\App Paths\brave.exe"),
+            ]
+            for root_key, sub_key in reg_paths:
+                try:
+                    with winreg.OpenKey(root_key, sub_key) as key:
+                        val, _ = winreg.QueryValueEx(key, "")
+                        if val and os.path.isfile(val):
+                            return val
+                except OSError:
+                    pass
+        except Exception:
+            pass
+
+    # 3. Known common file paths across platforms
+    program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+    program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    local_app_data = os.environ.get("LOCALAPPDATA", "")
+
     candidates = [
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+        # Windows - Chrome
+        os.path.join(program_files, "Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join(program_files_x86, "Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join(local_app_data, "Google", "Chrome", "Application", "chrome.exe"),
+        # Windows - Edge
+        os.path.join(program_files_x86, "Microsoft", "Edge", "Application", "msedge.exe"),
+        os.path.join(program_files, "Microsoft", "Edge", "Application", "msedge.exe"),
+        os.path.join(local_app_data, "Microsoft", "Edge", "Application", "msedge.exe"),
+        # Windows - Brave
+        os.path.join(program_files, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+        os.path.join(program_files_x86, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+        os.path.join(local_app_data, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+        # Linux
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/brave-browser",
+        "/snap/bin/chromium",
+        # macOS
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
     ]
+
     for path in candidates:
-        if os.path.isfile(path):
+        if path and os.path.isfile(path):
             return path
+
     return None
 
 
@@ -512,7 +568,15 @@ class FastLinkApp(ctk.CTk):
 
     def open_output_file(self):
         if os.path.exists("download_links.txt"):
-            os.system(f'notepad.exe "download_links.txt"')
+            try:
+                if sys.platform.startswith("win"):
+                    os.startfile("download_links.txt")
+                elif sys.platform.startswith("darwin"):
+                    subprocess.run(["open", "download_links.txt"])
+                else:
+                    subprocess.run(["xdg-open", "download_links.txt"])
+            except Exception as e:
+                messagebox.showwarning("Open File", f"Could not launch editor: {e}")
         else:
             messagebox.showinfo("Not Found", "download_links.txt has not been created yet.")
 

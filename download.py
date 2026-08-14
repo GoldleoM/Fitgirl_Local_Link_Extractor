@@ -84,8 +84,11 @@ for line in lines:
 
 output_file = "download_links.txt"
 
+from app import find_browser_path
+browser_path = find_browser_path()
 scraper_options = ChromiumOptions()
-scraper_options.set_browser_path(r'C:\Program Files\Google\Chrome\Application\chrome.exe')
+if browser_path:
+    scraper_options.set_browser_path(browser_path)
 page = ChromiumPage(scraper_options)
 
 for link in links:
