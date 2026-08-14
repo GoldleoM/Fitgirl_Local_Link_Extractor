@@ -2,6 +2,8 @@
 
 An automated, high-speed link generator that extracts direct `fuckingfast.co` download URLs from FitGirl Repacks, seamlessly handling Cloudflare Turnstile bot protection in the background.
 
+**Now with multi-threaded parallel extraction** — process 100+ links in seconds with smart pacing and auto-retry.
+
 ---
 
 ## 📋 Requirements
@@ -65,12 +67,26 @@ To build a fresh `.exe` from source:
    - Or click **`📂 Load File`** to load your `input.txt`.
 2. Click **`▶ Start Fetching Links`**.
 3. **Live Progress**:
-   - The app will automatically open your Chromium engine (Chrome, Edge, or Brave), bypass any Cloudflare Turnstile challenges, and extract the real download links.
+   - The app launches a multi-threaded parallel extraction engine with 8 concurrent browser tabs.
+   - Cloudflare Turnstile is solved once at startup, then all tabs ride the same session cookie for instant extraction.
    - The **Live Activity Console** will show real-time progress for each part.
 4. **Get Your Links**:
    - Extracted direct download URLs (`https://dl.fuckingfast.co/dl/...`) will appear in the right panel.
    - Click **`📑 Copy All Links`** to paste them straight into your download manager (**JDownloader 2**, **Internet Download Manager (IDM)**, or browser).
-   - All links are also automatically saved to **`download_links.txt`**.
+   - All links are also automatically saved to **`download_links.txt`** in sorted order.
+
+---
+
+### 2. ⚙️ Settings Panel
+Click the **⚙️ Settings** button in the header to configure:
+
+| Setting | Default | Description |
+| :--- | :---: | :--- |
+| **Parallel Threads** | 8 | Number of concurrent browser tabs (1–20). Higher = faster, but may trigger rate limits. |
+| **Stealth Mode** | On | Hides the browser window completely off-screen. Turn off to watch extraction live. |
+| **Request Delay** | 200ms | Pause between requests per thread. Prevents Cloudflare rate limiting. |
+| **Max Retries** | 3 | Auto-retry attempts if a link fails due to temporary challenges. |
+| **Page Timeout** | 16s | Maximum wait time for a page to load before skipping. |
 
 ---
 
@@ -96,7 +112,11 @@ If you prefer running without a GUI:
 - **Cause**: No Chromium-based browser is installed.
 - **Fix**: Ensure Google Chrome, Microsoft Edge, or Brave is installed. The tool automatically searches Windows Registry, System PATH, Program Files, and AppData directories.
 
-### 3. "HTTP 403 Forbidden" Error
+### 3. Rate Limiting / Many Failures
+- **Cause**: Too many parallel threads or too low request delay for your network.
+- **Fix**: Open **⚙️ Settings** and lower **Parallel Threads** to 4–6 and increase **Request Delay** to 300–500ms.
+
+### 4. "HTTP 403 Forbidden" Error
 - **Cause**: Occurs when trying to scrape `fuckingfast.co` with basic HTTP tools (like `curl` or `requests`) without browser fingerprinting.
 - **Fix**: Always run extraction through `FitGirl_Link_Extractor.exe`, `run.bat`, `app.py`, or `download.py`, which utilizes authentic Chromium DevTools Protocol (CDP) to pass Cloudflare checks.
 
@@ -108,7 +128,7 @@ If you prefer running without a GUI:
 Fitgirl_Local/
 │
 ├── FitGirl_Link_Extractor.exe # Standalone executable (runs on any Windows PC without Python)
-├── app.py                     # Modern GUI application (CustomTkinter + DrissionPage engine)
+├── app.py                     # Modern GUI application (CustomTkinter + multi-threaded DrissionPage engine)
 ├── download.py                # Standalone CLI extraction script
 ├── build.bat                  # One-click PyInstaller standalone builder
 ├── setup.bat                  # Automated environment validator & package installer
@@ -119,4 +139,3 @@ Fitgirl_Local/
 ├── download_links.txt         # Output file containing direct download URLs
 └── README.md                  # User guide and documentation
 ```
-

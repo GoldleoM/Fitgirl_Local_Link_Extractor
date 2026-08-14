@@ -88,15 +88,29 @@ def find_browser_path() -> Optional[str]:
 
 
 class LinkExtractorEngine:
+    """Multi-threaded parallel extraction engine with smart pacing and auto-retry."""
+
+    # Default settings
+    DEFAULT_SETTINGS = {
+        "max_concurrency": 8,
+        "stealth_mode": True,
+        "inter_request_delay": 0.20,
+        "max_retries": 3,
+        "page_load_timeout": 16,
+        "turnstile_timeout": 20,
+    }
+
     def __init__(
         self,
         log_callback: Optional[Callable[[str, str], None]] = None,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
         link_found_callback: Optional[Callable[[str, str], None]] = None,
+        settings: Optional[dict] = None,
     ):
         self.log_callback = log_callback or (lambda lvl, msg: None)
         self.progress_callback = progress_callback or (lambda cur, tot, url: None)
         self.link_found_callback = link_found_callback or (lambda orig, dl: None)
+        self.settings = {**self.DEFAULT_SETTINGS, **(settings or {})}
         self.is_running = False
         self.was_stopped = False
         self.page: Optional[ChromiumPage] = None
@@ -127,9 +141,35 @@ class LinkExtractorEngine:
             self.log("ERROR", "Could not locate Google Chrome or Edge on this system!")
             return
 
+        # Read settings
+        max_concurrency = self.settings["max_concurrency"]
+        stealth_mode = self.settings["stealth_mode"]
+        inter_request_delay = self.settings["inter_request_delay"]
+        max_retries = self.settings["max_retries"]
+        page_load_timeout = self.settings["page_load_timeout"]
+        turnstile_timeout = self.settings["turnstile_timeout"]
+        poll_interval = 0.02
+
+        total = len(clean_links)
+        pool_size = min(max_concurrency, total)
+        mode_str = "Stealth (Off-Screen)" if stealth_mode else "Visible Window"
+
         self.log("INFO", f"Launching browser engine ({os.path.basename(browser_path)})...")
+        self.log("INFO", f"Mode: {mode_str} | {pool_size} parallel workers | {int(inter_request_delay*1000)}ms pacing")
+
         options = ChromiumOptions()
         options.set_browser_path(browser_path)
+
+        if stealth_mode:
+            options.set_argument('--window-position=-32000,-32000')
+            options.set_argument('--window-size=1280,800')
+
+        options.set_argument('--blink-settings=imagesEnabled=false')
+        options.set_argument('--disable-gpu')
+        options.set_argument('--disable-extensions')
+        options.set_argument('--disable-notifications')
+        options.set_argument('--mute-audio')
+        options.set_load_mode('eager')
 
         try:
             self.page = ChromiumPage(options)
@@ -137,80 +177,157 @@ class LinkExtractorEngine:
             self.log("ERROR", f"Failed to start browser: {e}")
             return
 
-        total = len(clean_links)
-        self.log("INFO", f"Starting extraction for {total} link(s)...")
-
-        for idx, link in enumerate(clean_links, start=1):
-            if not self.is_running:
-                self.log("WARN", "Process stopped by user.")
-                break
-
-            self.progress_callback(idx, total, link)
-            self.log("INFO", f"[{idx}/{total}] Navigating to: {link}")
-
-            try:
-                self.page.get(link)
-            except Exception as e:
-                self.log("ERROR", f"Failed to load page: {e}")
-                continue
-
-            # Check for download button (indicates page loaded / challenge passed)
-            btn = self.page.ele("text:DOWNLOAD", timeout=15)
-            if not btn:
-                self.log("ERROR", f"[{idx}/{total}] Download button not found.")
-                continue
-
-            # Wait for Turnstile to clear (button becomes active/opaque)
-            active = False
-            for _ in range(30):
-                if not self.is_running:
-                    break
-                try:
-                    style = btn.attr("style")
-                    if not style or ("opacity" not in style and "0.5" not in style):
-                        active = True
+        # Session warmup — solve Turnstile once so all tabs inherit the cookie
+        self.log("INFO", "Warming up Cloudflare session clearance...")
+        try:
+            self.page.latest_tab.get(clean_links[0], retry=1, timeout=page_load_timeout)
+            warm_btn = self.page.latest_tab.ele('text:DOWNLOAD', timeout=8)
+            if warm_btn:
+                for _ in range(100):
+                    style = warm_btn.attr('style')
+                    if not style or ('opacity' not in style and '0.5' not in style):
                         break
-                except Exception:
-                    pass
-                time.sleep(0.5)
+                    time.sleep(0.05)
+            self.log("SUCCESS", "Session warmed up! Starting parallel pipeline...")
+        except Exception as e:
+            self.log("WARN", f"Warmup notice: {e}")
 
+        if not self.is_running:
+            return
+
+        # Create worker tab pool
+        worker_tabs = [self.page.latest_tab]
+        while len(worker_tabs) < pool_size:
+            worker_tabs.append(self.page.new_tab())
+
+        links_queue = queue.Queue()
+        for item in enumerate(clean_links, start=1):
+            links_queue.put((*item, 0))  # (index, url, retry_count)
+
+        extracted_results = []
+        extracted_count = [0]  # mutable counter for threads
+        file_lock = threading.Lock()
+        engine_ref = self
+
+        def worker_thread(worker_id: int, tab):
+            while engine_ref.is_running:
+                try:
+                    idx, link, retries = links_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+                file_id = link.split('/')[-1].split('#')[0]
+                retry_msg = f" (Retry {retries})" if retries > 0 else ""
+                engine_ref.log("INFO", f"[{idx}/{total}] [T#{worker_id:02d}] Navigating{retry_msg}: {link}")
+
+                try:
+                    time.sleep(inter_request_delay)
+
+                    tab.get(link, retry=1, timeout=page_load_timeout)
+
+                    btn = tab.ele('text:DOWNLOAD', timeout=page_load_timeout)
+                    if not btn:
+                        if retries < max_retries:
+                            backoff = 1.5 * (retries + 1)
+                            engine_ref.log("WARN", f"[{idx}/{total}] Button missing, retrying in {backoff:.1f}s...")
+                            time.sleep(backoff)
+                            links_queue.put((idx, link, retries + 1))
+                        else:
+                            engine_ref.log("ERROR", f"[{idx}/{total}] Download button not found: {link}")
+                        continue
+
+                    active = False
+                    for _ in range(int(turnstile_timeout / poll_interval)):
+                        if not engine_ref.is_running:
+                            break
+                        try:
+                            style = btn.attr('style')
+                            if not style or ('opacity' not in style and '0.5' not in style):
+                                active = True
+                                break
+                        except Exception:
+                            pass
+                        time.sleep(poll_interval)
+
+                    if not engine_ref.is_running:
+                        break
+
+                    if not active:
+                        if retries < max_retries:
+                            backoff = 2.0 * (retries + 1)
+                            engine_ref.log("WARN", f"[{idx}/{total}] Turnstile slow, retrying in {backoff:.1f}s...")
+                            time.sleep(backoff)
+                            links_queue.put((idx, link, retries + 1))
+                        else:
+                            engine_ref.log("WARN", f"[{idx}/{total}] Turnstile failed permanently: {link}")
+                        continue
+
+                    js_extract = f'''
+                        var xhr = new XMLHttpRequest();
+                        xhr.open('POST', '/f/{file_id}/go', false);
+                        xhr.setRequestHeader('HX-Request', 'true');
+                        xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+                        xhr.send('cf-turnstile-response=' + encodeURIComponent(window.turnstileToken || ''));
+                        return xhr.getResponseHeader('hx-redirect');
+                    '''
+
+                    dl_url = tab.run_js(js_extract)
+
+                    if dl_url:
+                        with file_lock:
+                            extracted_results.append((idx, dl_url))
+                            extracted_count[0] += 1
+                            try:
+                                with open(output_file, "a", encoding="utf-8") as f:
+                                    f.write(dl_url + "\n")
+                            except Exception:
+                                pass
+                        engine_ref.log("SUCCESS", f"[{idx}/{total}] Extracted: {dl_url}")
+                        engine_ref.link_found_callback(link, dl_url)
+                        engine_ref.progress_callback(extracted_count[0], total, dl_url)
+                    else:
+                        if retries < max_retries:
+                            engine_ref.log("WARN", f"[{idx}/{total}] Empty response, retrying...")
+                            time.sleep(1.5)
+                            links_queue.put((idx, link, retries + 1))
+                        else:
+                            engine_ref.log("WARN", f"[{idx}/{total}] Empty URL permanently: {link}")
+
+                except Exception as e:
+                    if retries < max_retries:
+                        time.sleep(1.5)
+                        links_queue.put((idx, link, retries + 1))
+                    else:
+                        engine_ref.log("ERROR", f"[{idx}/{total}] Error: {e}")
+                finally:
+                    links_queue.task_done()
+
+        # Launch worker threads with smooth stagger
+        threads = []
+        for w_id, w_tab in enumerate(worker_tabs, start=1):
             if not self.is_running:
                 break
+            t = threading.Thread(target=worker_thread, args=(w_id, w_tab), daemon=True)
+            threads.append(t)
+            t.start()
+            time.sleep(0.15)
 
-            if not active:
-                self.log("WARN", f"[{idx}/{total}] Turnstile challenge was not resolved in time.")
-                continue
+        # Wait for completion
+        try:
+            while self.is_running and (not links_queue.empty() or any(t.is_alive() for t in threads)):
+                time.sleep(0.2)
+        except Exception:
+            pass
 
-            # Extract via XHR without triggering browser downloads
-            file_id = link.split("/")[-1].split("#")[0]
-            js = f"""
-                var xhr = new XMLHttpRequest();
-                xhr.open('POST', '/f/{file_id}/go', false);
-                xhr.setRequestHeader('HX-Request', 'true');
-                xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
-                xhr.send('cf-turnstile-response=' + encodeURIComponent(window.turnstileToken || ''));
-                return xhr.getResponseHeader('hx-redirect');
-            """
-
-            download_url = None
+        # Sort and rewrite output file in correct order
+        if extracted_results:
+            extracted_results.sort(key=lambda x: x[0])
             try:
-                download_url = self.page.run_js(js)
-            except Exception as e:
-                self.log("WARN", f"[{idx}/{total}] XHR failed: {e}")
-
-            if not download_url:
-                self.log("ERROR", f"[{idx}/{total}] Download URL not found.")
-                continue
-
-            self.log("SUCCESS", f"[{idx}/{total}] Extracted: {download_url}")
-            self.link_found_callback(link, download_url)
-
-            # Append to download_links.txt immediately
-            try:
-                with open(output_file, "a", encoding="utf-8") as f:
-                    f.write(download_url + "\n")
-            except Exception as e:
-                self.log("WARN", f"Could not write to {output_file}: {e}")
+                with open(output_file, "w", encoding="utf-8") as f:
+                    for _, url in extracted_results:
+                        f.write(url + "\n")
+            except Exception:
+                pass
 
         if self.page:
             try:
@@ -220,8 +337,163 @@ class LinkExtractorEngine:
             self.page = None
 
         if not self.was_stopped:
-            self.log("SUCCESS", f"All done! Extracted links saved to {output_file}")
+            self.log("SUCCESS", f"All done! {len(extracted_results)}/{total} links extracted and saved to {output_file}")
         self.is_running = False
+
+
+class SettingsDialog(ctk.CTkToplevel):
+    """Modal settings dialog for configuring extraction parameters."""
+
+    def __init__(self, parent, current_settings: dict):
+        super().__init__(parent)
+        self.title("⚙️ Extraction Settings")
+        self.geometry("460x520")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        self.result = None  # Will hold the new settings if user clicks Save
+
+        # Center on parent
+        self.update_idletasks()
+        x = parent.winfo_x() + (parent.winfo_width() - 460) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - 520) // 2
+        self.geometry(f"+{x}+{y}")
+
+        self.grid_columnconfigure(0, weight=1)
+
+        # Title
+        title = ctk.CTkLabel(
+            self, text="Extraction Settings",
+            font=ctk.CTkFont(size=20, weight="bold"),
+            text_color=("#ec4899", "#f43f5e"),
+        )
+        title.grid(row=0, column=0, padx=20, pady=(20, 4))
+
+        subtitle = ctk.CTkLabel(
+            self, text="Tune performance, stealth, and retry behavior",
+            font=ctk.CTkFont(size=12), text_color="gray60",
+        )
+        subtitle.grid(row=1, column=0, padx=20, pady=(0, 16))
+
+        # Settings container
+        container = ctk.CTkFrame(self, corner_radius=12)
+        container.grid(row=2, column=0, padx=20, pady=0, sticky="ew")
+        container.grid_columnconfigure(1, weight=1)
+
+        row = 0
+
+        # --- Parallel Threads ---
+        ctk.CTkLabel(container, text="Parallel Threads", font=ctk.CTkFont(size=13, weight="bold")).grid(
+            row=row, column=0, padx=16, pady=(16, 2), sticky="w")
+        self.threads_var = tk.IntVar(value=current_settings.get("max_concurrency", 8))
+        threads_frame = ctk.CTkFrame(container, fg_color="transparent")
+        threads_frame.grid(row=row, column=1, padx=16, pady=(16, 2), sticky="e")
+        self.threads_label = ctk.CTkLabel(threads_frame, text=str(self.threads_var.get()),
+                                          font=ctk.CTkFont(size=13, weight="bold"), width=30)
+        self.threads_label.pack(side="right", padx=(8, 0))
+        self.threads_slider = ctk.CTkSlider(
+            threads_frame, from_=1, to=20, number_of_steps=19,
+            variable=self.threads_var, width=140,
+            command=lambda v: self.threads_label.configure(text=str(int(v))),
+        )
+        self.threads_slider.pack(side="right")
+        row += 1
+
+        # --- Stealth Mode ---
+        ctk.CTkLabel(container, text="Stealth Mode", font=ctk.CTkFont(size=13, weight="bold")).grid(
+            row=row, column=0, padx=16, pady=(12, 2), sticky="w")
+        ctk.CTkLabel(container, text="Hide browser window", font=ctk.CTkFont(size=11), text_color="gray60").grid(
+            row=row + 1, column=0, padx=16, pady=(0, 2), sticky="w")
+        self.stealth_var = tk.BooleanVar(value=current_settings.get("stealth_mode", True))
+        self.stealth_switch = ctk.CTkSwitch(
+            container, text="", variable=self.stealth_var,
+            onvalue=True, offvalue=False,
+        )
+        self.stealth_switch.grid(row=row, column=1, rowspan=2, padx=16, pady=(12, 2), sticky="e")
+        row += 2
+
+        # --- Request Delay ---
+        ctk.CTkLabel(container, text="Request Delay", font=ctk.CTkFont(size=13, weight="bold")).grid(
+            row=row, column=0, padx=16, pady=(12, 2), sticky="w")
+        delay_ms = int(current_settings.get("inter_request_delay", 0.20) * 1000)
+        self.delay_var = tk.IntVar(value=delay_ms)
+        delay_frame = ctk.CTkFrame(container, fg_color="transparent")
+        delay_frame.grid(row=row, column=1, padx=16, pady=(12, 2), sticky="e")
+        self.delay_label = ctk.CTkLabel(delay_frame, text=f"{delay_ms}ms",
+                                        font=ctk.CTkFont(size=13, weight="bold"), width=50)
+        self.delay_label.pack(side="right", padx=(8, 0))
+        self.delay_slider = ctk.CTkSlider(
+            delay_frame, from_=50, to=500, number_of_steps=18,
+            variable=self.delay_var, width=140,
+            command=lambda v: self.delay_label.configure(text=f"{int(v)}ms"),
+        )
+        self.delay_slider.pack(side="right")
+        row += 1
+
+        # --- Max Retries ---
+        ctk.CTkLabel(container, text="Max Retries", font=ctk.CTkFont(size=13, weight="bold")).grid(
+            row=row, column=0, padx=16, pady=(12, 2), sticky="w")
+        self.retries_var = tk.IntVar(value=current_settings.get("max_retries", 3))
+        retries_frame = ctk.CTkFrame(container, fg_color="transparent")
+        retries_frame.grid(row=row, column=1, padx=16, pady=(12, 2), sticky="e")
+        self.retries_label = ctk.CTkLabel(retries_frame, text=str(self.retries_var.get()),
+                                          font=ctk.CTkFont(size=13, weight="bold"), width=30)
+        self.retries_label.pack(side="right", padx=(8, 0))
+        self.retries_slider = ctk.CTkSlider(
+            retries_frame, from_=0, to=5, number_of_steps=5,
+            variable=self.retries_var, width=140,
+            command=lambda v: self.retries_label.configure(text=str(int(v))),
+        )
+        self.retries_slider.pack(side="right")
+        row += 1
+
+        # --- Page Timeout ---
+        ctk.CTkLabel(container, text="Page Timeout", font=ctk.CTkFont(size=13, weight="bold")).grid(
+            row=row, column=0, padx=16, pady=(12, 16), sticky="w")
+        self.timeout_var = tk.IntVar(value=current_settings.get("page_load_timeout", 16))
+        timeout_frame = ctk.CTkFrame(container, fg_color="transparent")
+        timeout_frame.grid(row=row, column=1, padx=16, pady=(12, 16), sticky="e")
+        self.timeout_label = ctk.CTkLabel(timeout_frame, text=f"{self.timeout_var.get()}s",
+                                          font=ctk.CTkFont(size=13, weight="bold"), width=40)
+        self.timeout_label.pack(side="right", padx=(8, 0))
+        self.timeout_slider = ctk.CTkSlider(
+            timeout_frame, from_=5, to=30, number_of_steps=25,
+            variable=self.timeout_var, width=140,
+            command=lambda v: self.timeout_label.configure(text=f"{int(v)}s"),
+        )
+        self.timeout_slider.pack(side="right")
+        row += 1
+
+        # --- Buttons ---
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.grid(row=3, column=0, padx=20, pady=(20, 20), sticky="ew")
+        btn_frame.grid_columnconfigure((0, 1), weight=1)
+
+        ctk.CTkButton(
+            btn_frame, text="Save Settings", height=38,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            fg_color=("#e11d48", "#be123c"), hover_color=("#be123c", "#9f1239"),
+            command=self.save_settings,
+        ).grid(row=0, column=0, padx=(0, 6), sticky="ew")
+
+        ctk.CTkButton(
+            btn_frame, text="Cancel", height=38,
+            font=ctk.CTkFont(size=14),
+            fg_color="#4b5563", hover_color="#374151",
+            command=self.destroy,
+        ).grid(row=0, column=1, padx=(6, 0), sticky="ew")
+
+    def save_settings(self):
+        self.result = {
+            "max_concurrency": int(self.threads_var.get()),
+            "stealth_mode": bool(self.stealth_var.get()),
+            "inter_request_delay": int(self.delay_var.get()) / 1000.0,
+            "max_retries": int(self.retries_var.get()),
+            "page_load_timeout": int(self.timeout_var.get()),
+            "turnstile_timeout": int(self.timeout_var.get()) + 4,
+        }
+        self.destroy()
 
 
 class FastLinkApp(ctk.CTk):
@@ -236,6 +508,9 @@ class FastLinkApp(ctk.CTk):
         self.msg_queue = queue.Queue()
         self.extractor: Optional[LinkExtractorEngine] = None
         self.worker_thread: Optional[threading.Thread] = None
+
+        # Extraction settings (defaults)
+        self.extraction_settings = dict(LinkExtractorEngine.DEFAULT_SETTINGS)
 
         # Build UI
         self.build_ui()
@@ -280,7 +555,19 @@ class FastLinkApp(ctk.CTk):
             padx=14,
             pady=4,
         )
-        self.status_badge.grid(row=0, column=2, rowspan=2, padx=16, pady=12, sticky="e")
+        self.status_badge.grid(row=0, column=3, rowspan=2, padx=(0, 16), pady=12, sticky="e")
+
+        settings_btn = ctk.CTkButton(
+            header_frame,
+            text="⚙️ Settings",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            width=110,
+            height=32,
+            fg_color=("#374151", "#2d3748"),
+            hover_color=("#4b5563", "#3b4252"),
+            command=self.open_settings,
+        )
+        settings_btn.grid(row=0, column=2, rowspan=2, padx=(0, 8), pady=12, sticky="e")
 
         # ---------------- MAIN CONTENT (SPLIT VIEW) ----------------
         main_paned = ctk.CTkFrame(self, fg_color="transparent")
@@ -697,6 +984,7 @@ class FastLinkApp(ctk.CTk):
             log_callback=self.log_message,
             progress_callback=self.on_progress,
             link_found_callback=self.on_link_found,
+            settings=dict(self.extraction_settings),
         )
 
         def worker():
@@ -713,6 +1001,18 @@ class FastLinkApp(ctk.CTk):
         if self.extractor:
             self.log_message("WARN", "Stopping extractor...")
             self.extractor.stop()
+
+    def open_settings(self):
+        dialog = SettingsDialog(self, self.extraction_settings)
+        self.wait_window(dialog)
+        if dialog.result is not None:
+            self.extraction_settings = dialog.result
+            self.log_message("INFO",
+                f"Settings updated: {self.extraction_settings['max_concurrency']} threads, "
+                f"{'Stealth' if self.extraction_settings['stealth_mode'] else 'Visible'} mode, "
+                f"{int(self.extraction_settings['inter_request_delay']*1000)}ms delay, "
+                f"{self.extraction_settings['max_retries']} retries"
+            )
 
     def on_closing(self):
         if self.extractor and self.extractor.is_running:
