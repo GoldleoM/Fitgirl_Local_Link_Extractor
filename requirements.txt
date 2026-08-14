@@ -1,0 +1,6 @@
+DrissionPage>=4.1.0
+customtkinter>=6.0.0
+darkdetect>=0.8.0
+beautifulsoup4>=4.12.0
+colorama>=0.4.6
+requests>=2.31.0
