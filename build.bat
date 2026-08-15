@@ -63,6 +63,7 @@ echo.
 echo [4/4] Finalizing build...
 if exist "dist\FitGirl_Link_Extractor.exe" (
     copy /y "dist\FitGirl_Link_Extractor.exe" "FitGirl_Link_Extractor.exe" >nul
+    certutil -hashfile "FitGirl_Link_Extractor.exe" SHA256 | findstr /r "^[0-9A-F][0-9A-F]" > "FitGirl_Link_Extractor.exe.sha256"
     color 0A
     echo ======================================================================
     echo [SUCCESS] Standalone executable created successfully!
@@ -71,6 +72,7 @@ if exist "dist\FitGirl_Link_Extractor.exe" (
     echo Executable location:
     echo   -^> .\FitGirl_Link_Extractor.exe
     echo   -^> .\dist\FitGirl_Link_Extractor.exe
+    echo   -^> .\FitGirl_Link_Extractor.exe.sha256
     echo.
     echo You can now send 'FitGirl_Link_Extractor.exe' to ANY Windows device.
     echo No Python installation or setup scripts needed on their machine!

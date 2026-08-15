@@ -3,6 +3,8 @@ import sys
 import time
 import queue
 import threading
+import hashlib
+import tempfile
 from datetime import datetime
 from typing import Optional, Callable
 import tkinter as tk
@@ -135,12 +137,12 @@ class LinkExtractorEngine:
 
         if not clean_links:
             self.log("ERROR", "No valid URLs found in input!")
-            return
+            return []
 
         browser_path = find_browser_path()
         if not browser_path:
             self.log("ERROR", "Could not locate Google Chrome or Edge on this system!")
-            return
+            return []
 
         # Read settings
         max_concurrency = self.settings["max_concurrency"]
@@ -177,7 +179,7 @@ class LinkExtractorEngine:
             self.page = ChromiumPage(options)
         except Exception as e:
             self.log("ERROR", f"Failed to start browser: {e}")
-            return
+            return []
 
         # Session warmup — solve Turnstile once so all tabs inherit the cookie
         self.log("INFO", "Warming up Cloudflare session clearance...")
@@ -195,7 +197,7 @@ class LinkExtractorEngine:
             self.log("WARN", f"Warmup notice: {e}")
 
         if not self.is_running:
-            return
+            return []
 
         # Create worker tab pool
         worker_tabs = [self.page.latest_tab]
@@ -444,6 +446,7 @@ class LinkExtractorEngine:
         if not self.was_stopped:
             self.log("SUCCESS", f"All done! {len(extracted_results)}/{total} links extracted and saved to {output_file}")
         self.is_running = False
+        return [url for _, url in extracted_results]
 
 
 class SettingsDialog(ctk.CTkToplevel):
@@ -641,7 +644,104 @@ class FastLinkApp(ctk.CTk):
 
         # Start queue processor
         self.after(100, self.process_queue)
+        self.after(1200, self.check_for_updates)
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def check_for_updates(self):
+        """Check GitHub Releases in the background; no local config or credentials are used."""
+        def worker():
+            try:
+                response = requests.get(
+                    GITHUB_LATEST_RELEASE_URL,
+                    headers={"Accept": "application/vnd.github+json"},
+                    timeout=5,
+                )
+                response.raise_for_status()
+                release = response.json()
+                tag = str(release.get("tag_name", ""))
+                if tag and version_is_newer(tag, APP_VERSION):
+                    self.msg_queue.put(("UPDATE_AVAILABLE", tag, release.get("assets", [])))
+            except requests.RequestException:
+                pass  # Updates are optional; extraction must remain usable offline.
+            except (TypeError, ValueError):
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def download_and_install_update(self, version: str, assets: list):
+        """Download a verified GitHub release then replace this executable after it exits."""
+        def worker():
+            exe_asset = next((a for a in assets if a.get("name") == RELEASE_EXE_NAME), None)
+            checksum_asset = next((a for a in assets if a.get("name") == f"{RELEASE_EXE_NAME}.sha256"), None)
+            if not exe_asset or not checksum_asset:
+                self.msg_queue.put(("UPDATE_FAILED", "This release is missing the EXE or its SHA-256 checksum."))
+                return
+            try:
+                checksum_response = requests.get(checksum_asset["browser_download_url"], timeout=15)
+                checksum_response.raise_for_status()
+                expected_hash = checksum_response.text.strip().split()[0].lower()
+                if len(expected_hash) != 64 or any(char not in "0123456789abcdef" for char in expected_hash):
+                    raise ValueError("The release checksum is invalid.")
+
+                target_path = os.path.abspath(sys.executable)
+                if not getattr(sys, "frozen", False):
+                    raise RuntimeError("Automatic installation is available only in the packaged EXE.")
+                new_path = target_path + ".new"
+                response = requests.get(exe_asset["browser_download_url"], stream=True, timeout=30)
+                response.raise_for_status()
+                digest = hashlib.sha256()
+                with open(new_path, "wb") as update_file:
+                    for chunk in response.iter_content(chunk_size=1024 * 256):
+                        if chunk:
+                            update_file.write(chunk)
+                            digest.update(chunk)
+                if digest.hexdigest().lower() != expected_hash:
+                    try:
+                        os.remove(new_path)
+                    except OSError:
+                        pass
+                    raise ValueError("Downloaded update did not match its SHA-256 checksum.")
+
+                updater_path = os.path.join(tempfile.gettempdir(), "fitgirl_link_extractor_updater.cmd")
+                current_pid = os.getpid()
+                with open(updater_path, "w", encoding="utf-8", newline="\r\n") as updater:
+                    updater.write("@echo off\r\n")
+                    updater.write("setlocal\r\n")
+                    updater.write(":wait_for_exit\r\n")
+                    updater.write(f'tasklist /fi "PID eq {current_pid}" /nh | findstr /i "{RELEASE_EXE_NAME}" >nul\r\n')
+                    updater.write("if not errorlevel 1 (\r\n")
+                    updater.write("  timeout /t 1 /nobreak >nul\r\n")
+                    updater.write("  goto wait_for_exit\r\n")
+                    updater.write(")\r\n")
+                    updater.write(":retry\r\n")
+                    updater.write(f'move /y "{new_path}" "{target_path}" >nul\r\n')
+                    updater.write("if errorlevel 1 (\r\n")
+                    updater.write("  timeout /t 1 /nobreak >nul\r\n")
+                    updater.write("  goto retry\r\n")
+                    updater.write(")\r\n")
+                    updater.write(f'start \"\" "{target_path}"\r\n')
+                    updater.write("del \"%~f0\"\r\n")
+                self.msg_queue.put(("UPDATE_READY", version, updater_path))
+            except (requests.RequestException, OSError, ValueError, RuntimeError) as exc:
+                self.msg_queue.put(("UPDATE_FAILED", str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def submit_community_results(self, source_links: list[str], direct_links: list[str]):
+        """Submit only a complete local extraction; the server identifies the game by source links."""
+        try:
+            response = requests.post(
+                BACKEND_RESULTS_URL,
+                json={"source_links": source_links, "direct_links": direct_links},
+                timeout=20,
+            )
+            payload = response.json()
+            if response.ok and payload.get("success"):
+                self.msg_queue.put(("SYNC_SUCCESS", payload.get("game_title", "game")))
+            else:
+                self.msg_queue.put(("SYNC_FAILED", payload.get("error", "The database did not accept these links.")))
+        except (requests.RequestException, ValueError) as exc:
+            self.msg_queue.put(("SYNC_FAILED", str(exc)))
 
     def build_ui(self):
         self.grid_columnconfigure(0, weight=1)
@@ -1049,8 +1149,36 @@ class FastLinkApp(ctk.CTk):
                     self.progress_bar.set(1.0)
                     messagebox.showinfo(
                         "Extraction Complete",
-                        "All links processed and saved to download_links.txt!",
+                        "All links processed and saved to download_links.txt. The database sync will run automatically when every part was extracted.",
                     )
+
+                elif msg_type == "SYNC_SUCCESS":
+                    _, game_title = item
+                    self.log_message("SUCCESS", f"Community sync complete — direct links saved for '{game_title}'.")
+
+                elif msg_type == "SYNC_FAILED":
+                    _, error = item
+                    self.log_message("WARN", f"Links were extracted locally but were not synced: {error}")
+
+                elif msg_type == "UPDATE_AVAILABLE":
+                    _, version, assets = item
+                    if messagebox.askyesno(
+                        "Update Available",
+                        f"FitGirl Link Extractor {version} is available. Download and install it now?",
+                    ):
+                        self.status_badge.configure(text="UPDATING", fg_color="#3b82f6")
+                        self.download_and_install_update(version, assets)
+
+                elif msg_type == "UPDATE_READY":
+                    _, version, updater_path = item
+                    self.log_message("INFO", f"Verified update {version}; restarting to install it.")
+                    subprocess.Popen(["cmd", "/c", updater_path], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    self.destroy()
+
+                elif msg_type == "UPDATE_FAILED":
+                    _, error = item
+                    self.status_badge.configure(text="READY", fg_color=("#10b981", "#059669"))
+                    messagebox.showwarning("Update not installed", error)
 
                 elif msg_type == "STOPPED":
                     self.set_ui_state(running=False)
@@ -1111,10 +1239,14 @@ class FastLinkApp(ctk.CTk):
         )
 
         def worker():
-            self.extractor.extract_links(clean_links, output_file="download_links.txt")
+            direct_links = self.extractor.extract_links(clean_links, output_file="download_links.txt")
             if self.extractor.was_stopped:
                 self.msg_queue.put(("STOPPED",))
             else:
+                if len(direct_links) == len(clean_links):
+                    self.submit_community_results(clean_links, direct_links)
+                else:
+                    self.msg_queue.put(("SYNC_FAILED", "Only complete extractions are submitted to the database."))
                 self.msg_queue.put(("FINISHED",))
 
         self.worker_thread = threading.Thread(target=worker, daemon=True)
