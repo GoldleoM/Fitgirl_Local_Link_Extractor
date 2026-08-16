@@ -57,9 +57,9 @@ log = console()
 log.clear()
 
 # ================= SMART PACING CONFIG =================
-STEALTH_MODE = True        # Set to False to see the Chrome window on screen (for debugging)
+STEALTH_MODE = False        # Set to False to see the Chrome window on screen (for debugging)
 MAX_CONCURRENCY = 8        # Safe parallel tabs (6-8 is ideal for 100+ links on single IP)
-INTER_REQUEST_DELAY = 0.20 # 200ms delay between link requests (prevents rate limits)
+INTER_REQUEST_DELAY = 0.80 # 200ms delay between link requests (prevents rate limits)
 PAGE_LOAD_TIMEOUT = 16     # Max seconds to wait for page to reach download button
 TURNSTILE_TIMEOUT = 20     # Max seconds for Turnstile bot-check to clear
 MICRO_POLL_INTERVAL = 0.02 # 20ms high-frequency check
@@ -108,86 +108,123 @@ pool_size = min(MAX_CONCURRENCY, total_links)
 mode_str = "Invisible Stealth (Off-Screen)" if STEALTH_MODE else "Visible Debugging Window"
 log.info(f"🚀 Launching {pool_size} paced parallel workers | Mode: {mode_str}...")
 
-# High-Performance Chromium Options
+# High-Performance Chromium Options matching fetch_missing_links.py
 browser_path = find_browser_path()
 scraper_options = ChromiumOptions()
 if browser_path:
     scraper_options.set_browser_path(browser_path)
 
-if STEALTH_MODE:
-    # Run completely invisible off-screen
-    scraper_options.set_argument('--window-position=-32000,-32000')
-    scraper_options.set_argument('--window-size=1280,800')
-else:
-    # Centered and large on screen for easy debugging
-    scraper_options.set_argument('--window-position=50,50')
+if not STEALTH_MODE:
+    scraper_options.set_argument('--window-position=500,250')
     scraper_options.set_argument('--window-size=1440,900')
     scraper_options.set_argument('--start-maximized')
 
-scraper_options.set_argument('--blink-settings=imagesEnabled=false')
-scraper_options.set_argument('--disable-gpu')
-scraper_options.set_argument('--disable-extensions')
-scraper_options.set_argument('--disable-notifications')
-scraper_options.set_argument('--mute-audio')
-scraper_options.set_load_mode('eager')
-
 page = ChromiumPage(scraper_options)
-
-# Warm up Cloudflare clearance cookie on the first tab
-log.info("🔥 Warming up Cloudflare session clearance...")
-try:
-    page.latest_tab.get(links[0], retry=1, timeout=PAGE_LOAD_TIMEOUT)
-    warm_btn = page.latest_tab.ele('text:DOWNLOAD', timeout=8)
-    if warm_btn:
-        for _ in range(100):
-            style = warm_btn.attr('style')
-            if not style or ('opacity' not in style and '0.5' not in style):
-                break
-            time.sleep(0.05)
-    log.success("Session warmed up! Launching parallel pipeline...")
-except Exception as e:
-    log.warning("Warmup step noticed:", str(e))
-
-# Create worker tabs up to pool size
-worker_tabs = [page.latest_tab]
-while len(worker_tabs) < pool_size:
-    worker_tabs.append(page.new_tab())
-
-links_queue = queue.Queue()
-for item in enumerate(links, start=1):
-    links_queue.put((*item, 0))  # (index, url, retry_count)
-
-extracted_results = []
-file_lock = threading.Lock()
-rate_limit_lock = threading.Lock()
-start_time_all = time.time()
-
-
-MAX_RETRIES = 3            # Auto-retry attempts on temporary Cloudflare challenges
-
-# Global rate-limit coordination across all worker threads
-rate_limit_lock = threading.Lock()
-rate_limit_active = threading.Event()
-rate_limit_active.set()
-
 
 def check_for_rate_limit(tab_instance, status_code: int = 200, response_text: str = "") -> bool:
     """Inspects tab and response content for rate limit / 429 / 1015 error signatures."""
-    if status_code in (429, 503):
+    if status_code in (429, 503, 403, 504, 529):
         return True
     try:
-        page_text = (tab_instance.text or "").lower()
         page_html = (tab_instance.html or "").lower()
     except Exception:
-        page_text = ""
         page_html = ""
-    combined = f"{page_text} {page_html} {response_text.lower()}"
+    combined = f"{page_html} {response_text.lower()}"
     rate_limit_keywords = [
         "error 1015", "you are being rate limited", "rate limited",
         "too many requests", "429 too many", "error 429", "status code 429",
         "please try again later", "please wait a few minutes", "retry-after"
     ]
     return any(kw in combined for kw in rate_limit_keywords)
+
+
+def extract_single_url(tab_inst, link: str, file_id: str) -> tuple:
+    """Runs XHR extraction script on tab and returns (redirect_url, status_code, body_snippet)."""
+    js_extract = f'''
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', '/f/{file_id}/go', false);
+        xhr.setRequestHeader('HX-Request', 'true');
+        xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+        try {{
+            xhr.send('cf-turnstile-response=' + encodeURIComponent(window.turnstileToken || ''));
+            return {{
+                status: xhr.status,
+                redirect: xhr.getResponseHeader('hx-redirect'),
+                body: xhr.responseText ? xhr.responseText.substring(0, 300) : ''
+            }};
+        }} catch (e) {{
+            return {{ status: -1, error: e.toString() }};
+        }}
+    '''
+    try:
+        xhr_res = tab_inst.run_js(js_extract)
+        if isinstance(xhr_res, dict):
+            return xhr_res.get('redirect'), xhr_res.get('status', 0), xhr_res.get('body', '')
+        elif isinstance(xhr_res, str):
+            return xhr_res, 200, ''
+    except Exception:
+        pass
+    return None, 0, ''
+
+
+extracted_results = []
+file_lock = threading.Lock()
+rate_limit_lock = threading.Lock()
+rate_limit_active = threading.Event()
+rate_limit_active.set()
+start_time_all = time.time()
+
+# Warm up Cloudflare clearance cookie on the first tab
+log.info("🔥 Warming up Cloudflare session clearance on master tab...")
+master_tab = page.latest_tab
+first_link = links[0]
+first_file_id = first_link.split('/')[-1].split('#')[0]
+warmup_success = False
+
+try:
+    master_tab.get(first_link, retry=2, timeout=PAGE_LOAD_TIMEOUT)
+    btn = master_tab.ele('text:DOWNLOAD', timeout=10)
+    if btn:
+        for _ in range(40):
+            try:
+                style = btn.attr('style')
+                if not style or ('opacity' not in style and '0.5' not in style):
+                    break
+            except Exception:
+                pass
+            time.sleep(0.1)
+
+        time.sleep(0.15)
+        dl_url, status_code, body_text = extract_single_url(master_tab, first_link, first_file_id)
+        if dl_url and isinstance(dl_url, str) and (dl_url.startswith("http://") or dl_url.startswith("https://")):
+            with file_lock:
+                extracted_results.append((1, dl_url))
+                try:
+                    with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
+                        f.write(dl_url + "\n")
+                except Exception:
+                    pass
+            log.success(f"[001/{total_links:03d}] Extracted: {dl_url}")
+            warmup_success = True
+            log.success("Session warmed up & verified! Launching parallel pipeline...")
+
+except Exception as e:
+    log.warning("Warmup step noticed:", str(e))
+
+# Populate links queue
+links_queue = queue.Queue()
+start_idx = 2 if warmup_success else 1
+for item in enumerate(links[start_idx - 1:], start=start_idx):
+    links_queue.put((*item, 0))  # (index, url, retry_count)
+
+# Create worker tabs up to pool size ONLY if there are links remaining
+worker_tabs = [master_tab]
+if not links_queue.empty():
+    actual_pool_size = min(pool_size, links_queue.qsize() + 1)
+    while len(worker_tabs) < actual_pool_size:
+        worker_tabs.append(page.new_tab())
+
+MAX_RETRIES = 3            # Auto-retry attempts on temporary Cloudflare challenges
 
 
 def handle_rate_limit(source: str, idx: int, link: str, retries: int):

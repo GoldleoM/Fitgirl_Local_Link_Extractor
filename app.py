@@ -14,6 +14,23 @@ from DrissionPage import ChromiumPage, ChromiumOptions
 
 import shutil
 import subprocess
+import requests
+
+
+APP_VERSION = "1.0.4"
+BACKEND_RESULTS_URL = "https://fitboy-backend.vercel.app/api/community-link-results"
+GITHUB_LATEST_RELEASE_URL = "https://api.github.com/repos/GoldleoM/Fitgirl_Local_Link_Extractor/releases/latest"
+RELEASE_EXE_NAME = "FitGirl_Link_Extractor.exe"
+
+
+def version_is_newer(candidate: str, current: str) -> bool:
+    """Compare simple semantic-version tags such as v1.2.0 without extra packages."""
+    def parts(value: str):
+        clean = value.strip().lstrip("vV").split("-", 1)[0]
+        return tuple(int(piece) if piece.isdigit() else 0 for piece in clean.split("."))
+    candidate_parts, current_parts = parts(candidate), parts(current)
+    width = max(len(candidate_parts), len(current_parts))
+    return candidate_parts + (0,) * (width - len(candidate_parts)) > current_parts + (0,) * (width - len(current_parts))
 
 # Set visual theme
 ctk.set_appearance_mode("Dark")
@@ -96,7 +113,7 @@ class LinkExtractorEngine:
     DEFAULT_SETTINGS = {
         "max_concurrency": 8,
         "stealth_mode": True,
-        "inter_request_delay": 0.20,
+        "inter_request_delay": 0.8,
         "max_retries": 3,
         "page_load_timeout": 16,
         "turnstile_timeout": 20,
@@ -162,51 +179,19 @@ class LinkExtractorEngine:
         self.log("INFO", f"Mode: {mode_str} | {pool_size} parallel workers | {int(inter_request_delay*1000)}ms pacing | {rate_limit_cooldown}s cooldown on rate limit")
 
         options = ChromiumOptions()
-        options.set_browser_path(browser_path)
+        if browser_path:
+            options.set_browser_path(browser_path)
 
-        if stealth_mode:
-            options.set_argument('--window-position=-32000,-32000')
-            options.set_argument('--window-size=1280,800')
-
-        options.set_argument('--blink-settings=imagesEnabled=false')
-        options.set_argument('--disable-gpu')
-        options.set_argument('--disable-extensions')
-        options.set_argument('--disable-notifications')
-        options.set_argument('--mute-audio')
-        options.set_load_mode('eager')
+        if not stealth_mode:
+            options.set_argument('--window-position=50,50')
+            options.set_argument('--window-size=1440,900')
+            options.set_argument('--start-maximized')
 
         try:
             self.page = ChromiumPage(options)
         except Exception as e:
             self.log("ERROR", f"Failed to start browser: {e}")
             return []
-
-        # Session warmup — solve Turnstile once so all tabs inherit the cookie
-        self.log("INFO", "Warming up Cloudflare session clearance...")
-        try:
-            self.page.latest_tab.get(clean_links[0], retry=1, timeout=page_load_timeout)
-            warm_btn = self.page.latest_tab.ele('text:DOWNLOAD', timeout=8)
-            if warm_btn:
-                for _ in range(100):
-                    style = warm_btn.attr('style')
-                    if not style or ('opacity' not in style and '0.5' not in style):
-                        break
-                    time.sleep(0.05)
-            self.log("SUCCESS", "Session warmed up! Starting parallel pipeline...")
-        except Exception as e:
-            self.log("WARN", f"Warmup notice: {e}")
-
-        if not self.is_running:
-            return []
-
-        # Create worker tab pool
-        worker_tabs = [self.page.latest_tab]
-        while len(worker_tabs) < pool_size:
-            worker_tabs.append(self.page.new_tab())
-
-        links_queue = queue.Queue()
-        for item in enumerate(clean_links, start=1):
-            links_queue.put((*item, 0))  # (index, url, retry_count)
 
         extracted_results = []
         extracted_count = [0]  # mutable counter for threads
@@ -220,25 +205,106 @@ class LinkExtractorEngine:
 
         def check_for_rate_limit(tab_instance, status_code: int = 200, response_text: str = "") -> bool:
             """Inspects tab and response content for Cloudflare challenge, 429, 1015, or rate limit signatures."""
-            if status_code in (429, 503, 403):
+            if status_code in (429, 503, 403, 504, 529):
                 return True
             try:
-                page_title = (tab_instance.title or "").lower()
-                page_text = (tab_instance.text or "").lower()
                 page_html = (tab_instance.html or "").lower()
             except Exception:
-                page_title = ""
-                page_text = ""
                 page_html = ""
-            combined = f"{page_title} {page_text} {page_html} {response_text.lower()}"
+            combined = f"{page_html} {response_text.lower()}"
             block_keywords = [
                 "error 1015", "you are being rate limited", "rate limited",
                 "too many requests", "429 too many", "error 429", "status code 429",
-                "please try again later", "please wait a few minutes", "retry-after",
-                "just a moment...", "checking your browser", "turnstile challenge",
-                "cf-challenge", "challenges.cloudflare.com"
+                "please try again later", "please wait a few minutes", "retry-after"
             ]
             return any(kw in combined for kw in block_keywords)
+
+        def extract_single_url(tab_inst, link: str, file_id: str) -> tuple[Optional[str], int, str]:
+            """Runs XHR extraction script on tab and returns (redirect_url, status_code, body_snippet)."""
+            js_extract = f'''
+                var xhr = new XMLHttpRequest();
+                xhr.open('POST', '/f/{file_id}/go', false);
+                xhr.setRequestHeader('HX-Request', 'true');
+                xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+                try {{
+                    xhr.send('cf-turnstile-response=' + encodeURIComponent(window.turnstileToken || ''));
+                    return {{
+                        status: xhr.status,
+                        redirect: xhr.getResponseHeader('hx-redirect'),
+                        body: xhr.responseText ? xhr.responseText.substring(0, 300) : ''
+                    }};
+                }} catch (e) {{
+                    return {{ status: -1, error: e.toString() }};
+                }}
+            '''
+            try:
+                xhr_res = tab_inst.run_js(js_extract)
+                if isinstance(xhr_res, dict):
+                    return xhr_res.get('redirect'), xhr_res.get('status', 0), xhr_res.get('body', '')
+                elif isinstance(xhr_res, str):
+                    return xhr_res, 200, ''
+            except Exception:
+                pass
+            return None, 0, ''
+
+        # Step 1: Warm up & clear Cloudflare / Turnstile on the single master tab BEFORE opening any extra tabs!
+        self.log("INFO", "Warming up Cloudflare session clearance on master tab...")
+        master_tab = self.page.latest_tab
+        first_link = clean_links[0]
+        first_file_id = first_link.split('/')[-1].split('#')[0]
+        warmup_success = False
+
+        try:
+            master_tab.get(first_link, retry=2, timeout=page_load_timeout)
+            btn = master_tab.ele('text:DOWNLOAD', timeout=10)
+            if btn:
+                for _ in range(40):
+                    if not self.is_running:
+                        break
+                    try:
+                        style = btn.attr('style')
+                        if not style or ('opacity' not in style and '0.5' not in style):
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.1)
+
+                time.sleep(0.15)
+                dl_url, status_code, body_text = extract_single_url(master_tab, first_link, first_file_id)
+                if dl_url and isinstance(dl_url, str) and (dl_url.startswith("http://") or dl_url.startswith("https://")):
+                    with file_lock:
+                        extracted_results.append((1, dl_url))
+                        extracted_count[0] += 1
+                        try:
+                            with open(output_file, "a", encoding="utf-8") as f:
+                                f.write(dl_url + "\n")
+                        except Exception:
+                            pass
+                    self.log("SUCCESS", f"[1/{total}] Extracted: {dl_url}")
+                    self.link_found_callback(first_link, dl_url)
+                    self.progress_callback(extracted_count[0], total, dl_url)
+                    warmup_success = True
+                    self.log("SUCCESS", "Session clearance verified! Starting parallel pipeline...")
+
+        except Exception as e:
+            self.log("WARN", f"Warmup notice: {e}")
+
+        if not self.is_running:
+            return []
+
+        # Populate links queue
+        links_queue = queue.Queue()
+        start_idx = 2 if warmup_success else 1
+        for idx, link in enumerate(clean_links[start_idx - 1:], start=start_idx):
+            links_queue.put((idx, link, 0))  # (index, url, retry_count)
+
+        # Create worker tab pool ONLY if there are links left to process
+        worker_tabs = [master_tab]
+        if not links_queue.empty():
+            remaining_links_count = links_queue.qsize()
+            actual_pool_size = min(pool_size, remaining_links_count + 1)
+            while len(worker_tabs) < actual_pool_size:
+                worker_tabs.append(self.page.new_tab())
 
         def handle_rate_limit(source: str, idx: int, link: str, retries: int, tab_instance=None):
             """Synchronously pauses all worker threads, clears the challenge on one tab, or conducts a countdown."""
@@ -255,7 +321,9 @@ class LinkExtractorEngine:
                             engine_ref.log("INFO", "Attempting automatic challenge resolution on master tab...")
                             btn = tab_instance.ele('text:DOWNLOAD', timeout=12)
                             if btn:
-                                solved = True
+                                style = btn.attr('style') or ''
+                                if 'opacity' not in style or '0.5' not in style:
+                                    solved = True
                         except Exception:
                             pass
 
@@ -353,27 +421,7 @@ class LinkExtractorEngine:
                             engine_ref.log("WARN", f"[{idx}/{total}] Turnstile failed permanently: {link}")
                         continue
 
-                    js_extract = f'''
-                        var xhr = new XMLHttpRequest();
-                        xhr.open('POST', '/f/{file_id}/go', false);
-                        xhr.setRequestHeader('HX-Request', 'true');
-                        xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
-                        try {{
-                            xhr.send('cf-turnstile-response=' + encodeURIComponent(window.turnstileToken || ''));
-                            return {{
-                                status: xhr.status,
-                                redirect: xhr.getResponseHeader('hx-redirect'),
-                                body: xhr.responseText ? xhr.responseText.substring(0, 300) : ''
-                            }};
-                        }} catch (e) {{
-                            return {{ status: -1, error: e.toString() }};
-                        }}
-                    '''
-
-                    xhr_res = tab.run_js(js_extract)
-                    status_code = xhr_res.get('status', 0) if isinstance(xhr_res, dict) else 200
-                    body_text = xhr_res.get('body', '') if isinstance(xhr_res, dict) else ''
-                    dl_url = xhr_res.get('redirect') if isinstance(xhr_res, dict) else xhr_res
+                    dl_url, status_code, body_text = extract_single_url(tab, link, file_id)
 
                     if check_for_rate_limit(tab, status_code=status_code, response_text=body_text):
                         handle_rate_limit(f"XHR Code {status_code} on #{idx}", idx, link, retries, tab_instance=tab)
